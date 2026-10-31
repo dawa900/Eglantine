@@ -11,9 +11,26 @@ on:
     branches:
       - nx2
       - nx2-experimental
+    # A binary only changes when build inputs change; docs-only pushes skip the build.
+    paths:
+      - "src/**"
+      - "CMakeLists.txt"
+      - "CMakeModules/**"
+      - "externals/**"
+      - "dist/**"
+      - "tools/**"
+      - ".patch/**"
+      - "cpmfile.json"
+      - ".github/workflows/release-binaries.yml"
 
 permissions:
   contents: read
+
+# Clang major the Linux PGO build uses, from apt.llvm.org. Eden's profile is written by a current
+# clang and an older reader refuses it, so this has to stay at or above whatever produced
+# eden.profdata; bump it when a refreshed profile needs a newer LLVM.
+env:
+  PGO_LLVM_VERSION: '23'
 
 concurrency:
   group: release-binaries-${{ github.ref }}
@@ -23,6 +40,10 @@ jobs:
   build:
     name: ${{ matrix.platform }} binary
     runs-on: ${{ matrix.runner }}
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 1500M
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
     strategy:
       fail-fast: false
       matrix:
@@ -59,7 +80,7 @@ jobs:
             libswscale-dev pkg-config zlib1g-dev libva-dev libvdpau-dev \
             spirv-tools spirv-headers libusb-1.0-0-dev \
             libboost-dev libboost-fiber-dev libboost-context-dev \
-            libopus-dev libasound2-dev
+            libopus-dev libasound2-dev ccache
 
       - name: Install Qt on Linux
         if: startsWith(matrix.platform, 'linux')
@@ -72,8 +93,10 @@ jobs:
           modules: qtcharts
           cache: true
 
-      # The profile is written by a current clang, so use the newest clang from the LLVM apt repo
-      # rather than Ubuntu's; an older reader rejects a newer profile.
+      # Ubuntu's own clang 18 cannot read a profile from a current LLVM, so take clang from the LLVM
+      # apt repo. The versioned packages are named explicitly: that repo's unversioned clang/lld
+      # metapackages can lag the binaries they depend on and then resolve to nothing. lld-23 only
+      # ships ld.lld under /usr/lib/llvm-23/bin, so -B points the linker search there.
       - name: Install clang for PGO
         if: startsWith(matrix.platform, 'linux') && matrix.pgo
         shell: bash
@@ -81,11 +104,12 @@ jobs:
           set -euo pipefail
           curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key |
             sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
-          echo 'deb http://apt.llvm.org/noble/ llvm-toolchain-noble main' |
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-$PGO_LLVM_VERSION main" |
             sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang lld
-          clang --version
+          sudo apt-get install -y --no-install-recommends \
+            "clang-$PGO_LLVM_VERSION" "lld-$PGO_LLVM_VERSION"
+          "clang-$PGO_LLVM_VERSION" --version
 
       # Fetched into the source tree so both the Linux and MSYS2 configure steps can read it from a
       # path their clang understands.
@@ -113,6 +137,18 @@ jobs:
           modules: qtcharts
           cache: true
 
+      # MSVC is not something ccache handles well, so that job uses sccache. The other jobs use
+      # ccache, which CMake enables through USE_CCACHE (externals/cmake-modules/UseCcache.cmake).
+      - name: Install sccache on Windows
+        if: matrix.platform == 'windows-x86_64'
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'sccache.zip'
+          Invoke-WebRequest -OutFile $zip https://github.com/mozilla/sccache/releases/download/v0.19.0/sccache-v0.19.0-x86_64-pc-windows-msvc.zip
+          Expand-Archive $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'sccache')
+          $bin = (Get-ChildItem -Recurse -Filter sccache.exe (Join-Path $env:RUNNER_TEMP 'sccache')).DirectoryName
+          $bin | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
       - name: Install Vulkan SDK on Windows
         if: matrix.platform == 'windows-x86_64'
         shell: pwsh
@@ -136,10 +172,10 @@ jobs:
           pacboy: >-
             toolchain:p clang:p lld:p cmake:p python-pip:p
             qt6-base:p qt6-charts:p qt6-tools:p qt6-translations:p qt6-svg:p
-            openssl:p boost:p fmt:p lz4:p nlohmann-json:p zlib:p zstd:p
+            openssl:p boost:p fmt:p lz4:p nlohmann-json:p zlib:p zstd:p libiconv:p
             vulkan-memory-allocator:p vulkan-devel:p glslang:p enet:p opus:p
             libusb:p unordered_dense:p jbigkit:p xz:p libdeflate:p bzip2:p
-            lerc:p graphite2:p libwebp:p libtiff:p brotli:p
+            lerc:p graphite2:p libwebp:p libtiff:p brotli:p ccache:p
 
       - name: Cache CPM downloads
         uses: actions/cache@v4
@@ -148,6 +184,18 @@ jobs:
           key: cpm-${{ runner.os }}-${{ hashFiles('cpmfile.json', 'CMakeLists.txt', 'src/**/CMakeLists.txt') }}
           restore-keys: |
             cpm-${{ runner.os }}-
+
+      # The sha in the key makes every run save a fresh cache (actions/cache never saves over an
+      # exact hit), and restore-keys seeds it from the newest one of the same platform.
+      - name: Cache compiler objects
+        uses: actions/cache@v4
+        with:
+          path: |
+            .ccache
+            .sccache
+          key: objects-${{ matrix.platform }}-${{ github.sha }}
+          restore-keys: |
+            objects-${{ matrix.platform }}-
 
       - name: Configure Linux
         if: startsWith(matrix.platform, 'linux')
@@ -168,15 +216,16 @@ jobs:
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON
             -DENABLE_UPDATE_CHECKER=OFF
             -DUSE_DISCORD_PRESENCE=OFF
+            -DUSE_CCACHE=ON
           )
           if [ '${{ matrix.pgo }}' = 'true' ]; then
             # Same flags Eden's CI passes for its clang PGO build.
             profile="-fprofile-use=$PWD/eden.profdata -Wno-backend-plugin \
               -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
             flags+=(
-              -DCMAKE_C_COMPILER=clang
-              -DCMAKE_CXX_COMPILER=clang++
-              -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld
+              "-DCMAKE_C_COMPILER=clang-$PGO_LLVM_VERSION"
+              "-DCMAKE_CXX_COMPILER=clang++-$PGO_LLVM_VERSION"
+              "-DCMAKE_EXE_LINKER_FLAGS=-B/usr/lib/llvm-$PGO_LLVM_VERSION/bin -fuse-ld=lld"
               "-DCMAKE_C_FLAGS=$profile"
               "-DCMAKE_CXX_FLAGS=$profile"
             )
@@ -198,6 +247,8 @@ jobs:
           -DYUZU_USE_BUNDLED_SDL3=ON
           -DENABLE_UPDATE_CHECKER=OFF
           -DUSE_DISCORD_PRESENCE=OFF
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
 
       # MinGW build: system Qt and libraries from MSYS2, clang plus Eden's PGO profile. The profile
       # path is converted to its Windows form because clang runs with the MSYS mount underneath.
@@ -217,10 +268,12 @@ jobs:
             -DYUZU_ROOM_STANDALONE=OFF \
             -DYUZU_USE_BUNDLED_QT=OFF \
             -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DYUZU_USE_BUNDLED_FFMPEG=ON \
             -DVulkanHeaders_FORCE_BUNDLED=ON \
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
             -DENABLE_UPDATE_CHECKER=OFF \
             -DUSE_DISCORD_PRESENCE=OFF \
+            -DUSE_CCACHE=ON \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld \
@@ -230,12 +283,16 @@ jobs:
       - name: Build
         if: ${{ ! matrix.mingw }}
         shell: bash
-        run: cmake --build build/release --target yuzu yuzu-cmd --parallel
+        run: |
+          cmake --build build/release --target yuzu yuzu-cmd --parallel
+          if command -v ccache > /dev/null; then ccache --show-stats; else sccache --show-stats; fi
 
       - name: Build MinGW PGO
         if: matrix.mingw
         shell: msys2 {0}
-        run: cmake --build build/release --target yuzu yuzu-cmd --parallel
+        run: |
+          cmake --build build/release --target yuzu yuzu-cmd --parallel
+          ccache --show-stats
 
       # A self-contained AppImage: linuxdeploy bundles every library the two programs need except
       # the base system ones (glibc, X11/Wayland client libraries, the GPU driver and Vulkan loader),
