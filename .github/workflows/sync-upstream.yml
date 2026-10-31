@@ -1,0 +1,35 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # SYNC_TOKEN (PAT with repo+workflow scope) is only needed when upstream changes .github/workflows
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Backup tag, then merge upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/Djihads80/Eglantine.git
+          git fetch upstream nx2
+          if git merge-base --is-ancestor upstream/nx2 HEAD; then
+            echo "Already up to date"
+            exit 0
+          fi
+          tag="backup/$(date -u +%Y-%m-%d)-$(git rev-parse --short=10 HEAD)"
+          git tag "$tag"
+          git push origin "$tag"
+          git merge upstream/nx2 -m "Sync upstream nx2"
+          git push origin HEAD
