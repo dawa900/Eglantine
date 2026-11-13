@@ -22,19 +22,26 @@ on:
   workflow_dispatch:
     inputs:
       kind:
-        description: What to build (daily is only allowed from nx2)
+        description: What to build (daily is only allowed on the daily branch)
         type: choice
         options: [branch, daily]
         default: branch
-      platforms:
-        description: Which OS builds to run
-        type: choice
-        options: [all, linux, windows, macos]
-        default: all
+      build_linux:
+        description: Build Linux binaries
+        type: boolean
+        default: true
+      build_windows:
+        description: Build Windows binaries
+        type: boolean
+        default: true
+      build_macos:
+        description: Build macOS binaries
+        type: boolean
+        default: true
       pgo:
         description: Also build the PGO variants
         type: choice
-        options: [none, both]
+        options: [none, both, only]
         default: none
       publish:
         description: Publish the binaries as a GitHub pre-release (otherwise only workflow artifacts)
@@ -51,7 +58,7 @@ permissions:
 concurrency:
   # Manual and scheduled daily builds share a group; PR and manual branch builds share a group
   # for the source branch so they cannot race while replacing the same rolling release.
-  group: ci-${{ (github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || (github.event.action == 'labeled' && github.event.label.name != 'ci:build'))) && format('ignored-{0}', github.run_id) || (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.kind == 'daily')) && 'daily-nx2' || (github.event_name == 'pull_request' && format('branch-{0}', github.event.pull_request.head.ref)) || (github.event_name == 'workflow_dispatch' && format('branch-{0}', github.ref_name)) || format('release-{0}', github.ref) }}
+  group: ci-${{ (github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || (github.event.action == 'labeled' && github.event.label.name != 'ci:build'))) && format('ignored-{0}', github.run_id) || (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.kind == 'daily')) && 'daily' || (github.event_name == 'pull_request' && format('branch-{0}', github.event.pull_request.head.ref)) || (github.event_name == 'workflow_dispatch' && format('branch-{0}', github.ref_name)) || format('release-{0}', github.ref) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.kind != 'daily') }}
 
 jobs:
@@ -63,7 +70,7 @@ jobs:
         contains(github.event.pull_request.labels.*.name, 'ci:build') &&
         (github.event.action != 'labeled' || github.event.label.name == 'ci:build')
       )
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       pull-requests: read
@@ -94,11 +101,12 @@ jobs:
         shell: bash
         env:
           TARGET_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          DAILY_BRANCH: ${{ vars.DAILY_BRANCH || 'nx2-experimental' }}
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = schedule ]; then
-            git fetch --no-tags origin nx2:refs/remotes/origin/nx2
-            sha=$(git rev-parse refs/remotes/origin/nx2)
+            git fetch --no-tags origin "$DAILY_BRANCH:refs/remotes/origin/$DAILY_BRANCH"
+            sha=$(git rev-parse "refs/remotes/origin/$DAILY_BRANCH")
           else
             git fetch --no-tags origin "$TARGET_SHA"
             sha="$TARGET_SHA"
@@ -128,7 +136,7 @@ jobs:
     needs: prepare
     if: >-
       needs.prepare.outputs.skip != 'true' &&
-      (inputs.platforms == '' || inputs.platforms == 'all' || inputs.platforms == 'linux')
+      (github.event_name != 'workflow_dispatch' || inputs.build_linux)
     uses: ./.github/workflows/build-linux.yml
     with:
       sha: ${{ needs.prepare.outputs.sha }}
@@ -144,7 +152,7 @@ jobs:
     needs: prepare
     if: >-
       needs.prepare.outputs.skip != 'true' &&
-      (inputs.platforms == '' || inputs.platforms == 'all' || inputs.platforms == 'windows')
+      (github.event_name != 'workflow_dispatch' || inputs.build_windows)
     uses: ./.github/workflows/build-windows.yml
     with:
       sha: ${{ needs.prepare.outputs.sha }}
@@ -160,7 +168,7 @@ jobs:
     needs: prepare
     if: >-
       needs.prepare.outputs.skip != 'true' &&
-      (inputs.platforms == '' || inputs.platforms == 'all' || inputs.platforms == 'macos')
+      (github.event_name != 'workflow_dispatch' || inputs.build_macos)
     uses: ./.github/workflows/build-macos.yml
     with:
       sha: ${{ needs.prepare.outputs.sha }}
@@ -169,7 +177,7 @@ jobs:
       tag: ${{ needs.prepare.outputs.tag }}
       release: ${{ needs.prepare.outputs.kind == 'stable' || needs.prepare.outputs.kind == 'rc' }}
       nightly: ${{ needs.prepare.outputs.nightly == 'true' }}
-      runner: ${{ vars.MACOS_RUNNER || 'macos-15' }}
+      runner: ${{ vars.MACOS_RUNNER || 'macos-26' }}
 
   # Publishes only when every OS that ran succeeded (skipped OSes don't count).
   release:
@@ -195,4 +203,4 @@ jobs:
       sha: ${{ needs.prepare.outputs.sha }}
       prev_tag: ${{ needs.prepare.outputs.prev_tag }}
       branch: ${{ needs.prepare.outputs.branch }}
-      macos_runner: ${{ vars.MACOS_RUNNER || 'macos-15' }}
+      macos_runner: ${{ vars.MACOS_RUNNER || 'macos-26' }}
